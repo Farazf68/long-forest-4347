@@ -17,6 +17,9 @@ Radiology board review: flashcards and podcasts for every Core Radiology module,
 
 ## Deploy
 
+Cloudflare Workers Builds deploys automatically on every push to the `claude` branch.
+To deploy by hand instead:
+
 ```sh
 npm install
 npx wrangler secret put ADMIN_TOKEN   # only if you haven't set it before; pick a long random string
