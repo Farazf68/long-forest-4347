@@ -1,6 +1,6 @@
 {
   "name": "long-forest-4347",
-  "version": "0.0.0",
+  "version": "6.0.0",
   "private": true,
   "scripts": {
     "deploy": "wrangler deploy",
@@ -9,5 +9,6 @@
   },
   "devDependencies": {
     "wrangler": "^4.151.1"
-  }
+  },
+  "type": "module"
 }
