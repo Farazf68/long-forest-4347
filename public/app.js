@@ -137,7 +137,9 @@
     syncing: false,
     syncError: null,
     lastSync: 0,
+    base: {},           // server version of each doc this device has already merged
   };
+  function persistBase() { idb.put("kv", "base", S.base).catch(() => {}); }
   function lsGet(k) { try { return localStorage.getItem(k); } catch { return null; } }
   function lsSet(k, v) { try { v == null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch { /* ignore */ } }
 
@@ -168,6 +170,7 @@
         ? u.custom.filter((c) => c && /^misc-[a-z0-9-]{1,60}$/.test(c.id) && typeof c.name === "string")
             .map((c) => ({ id: c.id, name: c.name.slice(0, 120), created: Number(c.created) || 0 }))
         : [],
+      deletedCustom: Array.isArray(u && u.deletedCustom) ? u.deletedCustom.filter((x) => typeof x === "string").slice(-500) : [],
       updatedAt: Number(u && u.updatedAt) || 0,
     };
   }
@@ -250,15 +253,16 @@
     S.syncing = true; S.syncError = null; renderSync();
     try {
       // small docs first, then decks, then binaries
+      if ([...S.outbox.keys()].some((op) => /^(user|pods|deck:)/.test(op))) await pull();
       const rank = (op) => (op.startsWith("user") || op.startsWith("pods") ? 0 : op.startsWith("deck") || op.startsWith("del") ? 1 : 2);
       const ops = [...S.outbox.entries()].sort((a, b) => rank(a[0]) - rank(b[0]));
       for (const [op, seq] of ops) {
         const [kind, ...rest] = op.split(":");
         const arg = rest.join(":");
-        if (kind === "user") await putJSON("/api/flashcards/user", S.user);
-        else if (kind === "pods") await putJSON("/api/flashcards/podcasts", S.pods);
-        else if (kind === "deck") { if (S.decks[arg]) await putJSON(`/api/flashcards/cards/${arg}`, S.decks[arg]); }
-        else if (kind === "deldeck") await api(`/api/flashcards/cards/${arg}`, { method: "DELETE" });
+        if (kind === "user") { await putJSON("/api/flashcards/user", S.user); S.base.user = S.user.updatedAt; }
+        else if (kind === "pods") { await putJSON("/api/flashcards/podcasts", S.pods); S.base.pods = S.pods.updatedAt; }
+        else if (kind === "deck") { if (S.decks[arg]) { await putJSON(`/api/flashcards/cards/${arg}`, S.decks[arg]); S.base["deck:" + arg] = S.decks[arg].updatedAt; } }
+        else if (kind === "deldeck") { await api(`/api/flashcards/cards/${arg}`, { method: "DELETE" }); delete S.base["deck:" + arg]; }
         else if (kind === "media") {
           const b = await idb.get("blobs", "media/" + arg);
           const [mid, ...n] = arg.split("/");
@@ -272,6 +276,7 @@
         } else if (kind === "delaudio") { await api(`/api/audio/${arg}`, { method: "DELETE" }); delete S.serverAudio[arg]; }
         if (S.outbox.get(op) === seq) S.outbox.delete(op); // changed while uploading? keep it queued
         persistOutbox();
+        persistBase();
       }
       S.lastSync = Date.now();
     } catch (e) {
@@ -283,34 +288,96 @@
     }
   }
 
+  /* ---------- merging: newest change per card wins, so no device overwrites another ---------- */
+  function mergeDeck(local, remote) {
+    const byId = new Map(local.cards.map((c) => [c.id, c]));
+    for (const rc of normalizeDeck(remote).cards) {
+      const lc = byId.get(rc.id);
+      if (!lc) { local.cards.push(rc); byId.set(rc.id, rc); continue; }
+      const rl = rc.srs.last || 0, ll = lc.srs.last || 0;
+      // update in place so a study session holding this card sees the change
+      if (rl > ll || (rl === ll && rc.buriedUntil > lc.buriedUntil)) Object.assign(lc, rc);
+    }
+  }
+  function mergePods(local, remote) {
+    for (const [k, v] of Object.entries(normalizePods(remote).items)) {
+      const l = local.items[k];
+      if (!l || v.last > l.last) local.items[k] = v;
+    }
+  }
+  function mergeUser(local, remote) {
+    const r = normalizeUser(remote);
+    if (r.updatedAt > local.updatedAt) local.settings = r.settings;
+    for (const [day, e] of Object.entries(r.log)) {
+      const l = local.log[day];
+      if (!l || (e.reviews || 0) > (l.reviews || 0)) local.log[day] = { ...e, extraNew: Math.max(e.extraNew || 0, (l && l.extraNew) || 0) };
+    }
+    const gone = new Set([...(local.deletedCustom || []), ...r.deletedCustom]);
+    const mine = new Map(local.custom.map((c) => [c.id, c]));
+    for (const c of r.custom) {
+      if (!mine.has(c.id)) local.custom.push(c);
+      else if (r.updatedAt > local.updatedAt) mine.get(c.id).name = c.name;
+    }
+    local.custom = local.custom.filter((c) => !gone.has(c.id));
+    local.deletedCustom = [...gone];
+  }
+
+  /* Bring in anything another device saved since we last looked, merging it with this device's data. */
   async function pull() {
     const man = await getJSON("/api/flashcards");
     S.serverAudio = man.audio || {};
     const pending = (op) => S.outbox.has(op);
-    if (man.user && man.user.updatedAt > S.user.updatedAt && !pending("user")) {
+    // after a merge, a doc with unsent local changes gets a fresh timestamp so other devices fetch the merged copy
+    const stamp = (doc, op, serverAt) => { doc.updatedAt = pending(op) ? Date.now() : Math.max(doc.updatedAt || 0, serverAt); };
+
+    const su = (man.user && man.user.updatedAt) || 0;
+    if (su > (S.base.user || 0)) {
       const u = await getJSON("/api/flashcards/user");
-      if (u) { S.user = normalizeUser(u); await idb.put("kv", "user", S.user); rebuildMods(); applyTheme(); }
-    } else if (S.user.updatedAt > ((man.user && man.user.updatedAt) || 0)) queue("user");
-    if (man.podcasts && man.podcasts.updatedAt > S.pods.updatedAt && !pending("pods")) {
-      const p = await getJSON("/api/flashcards/podcasts");
-      if (p) { S.pods = normalizePods(p); await idb.put("kv", "pods", S.pods); }
-    } else if (S.pods.updatedAt > ((man.podcasts && man.podcasts.updatedAt) || 0)) queue("pods");
+      if (u) { mergeUser(S.user, u); stamp(S.user, "user", su); await idb.put("kv", "user", S.user); rebuildMods(); applyTheme(); }
+      S.base.user = su;
+    }
+    if (S.user.updatedAt > su && S.user.updatedAt > 0) queue("user");
+
+    const sp = (man.podcasts && man.podcasts.updatedAt) || 0;
+    if (sp > (S.base.pods || 0)) {
+      const pd = await getJSON("/api/flashcards/podcasts");
+      if (pd) { mergePods(S.pods, pd); stamp(S.pods, "pods", sp); await idb.put("kv", "pods", S.pods); }
+      S.base.pods = sp;
+    }
+    if (S.pods.updatedAt > sp && S.pods.updatedAt > 0) queue("pods");
 
     const remote = man.cards || {};
     for (const [mid, info] of Object.entries(remote)) {
-      if (!MOD[mid] || pending("deck:" + mid) || pending("deldeck:" + mid)) continue;
-      const loc = S.decks[mid];
-      if (!loc || info.updatedAt > loc.updatedAt) {
+      if (pending("deldeck:" + mid)) continue;
+      const key = "deck:" + mid;
+      if (info.updatedAt > (S.base[key] || 0) || !S.decks[mid]) {
         const d = await getJSON(`/api/flashcards/cards/${mid}`);
-        S.decks[mid] = normalizeDeck(d);
-        if (!S.decks[mid].updatedAt) S.decks[mid].updatedAt = info.updatedAt || 1;
+        if (S.decks[mid]) mergeDeck(S.decks[mid], d);
+        else S.decks[mid] = normalizeDeck(d);
+        stamp(S.decks[mid], key, info.updatedAt || 1);
         await idb.put("decks", mid, S.decks[mid]);
-      } else if (loc.updatedAt > info.updatedAt) queue("deck:" + mid);
+        S.base[key] = info.updatedAt;
+      }
+      if (S.decks[mid].updatedAt > info.updatedAt) queue(key);
     }
-    // decks removed on another device
+    // decks deleted on another device
     for (const mid of Object.keys(S.decks)) {
-      if (!(mid in remote) && !pending("deck:" + mid)) { delete S.decks[mid]; await idb.del("decks", mid); }
+      if (!(mid in remote) && !pending("deck:" + mid)) { delete S.decks[mid]; delete S.base["deck:" + mid]; await idb.del("decks", mid); }
     }
+    persistBase();
+    pruneSession();
+  }
+
+  /* If a pull changed cards that an open study session was holding, drop the ones no longer due. */
+  function pruneSession() {
+    if (typeof session === "undefined" || !session || session.finished) return;
+    const now = Date.now();
+    const end = session.ahead ? addDays(nextDayStart(now), AHEAD_DAYS) : nextDayStart(now);
+    const ok = (p) => !isLater(p[1], now) && (p[1].srs.state === "new" || p[1].srs.due < end);
+    session.reviews = session.reviews.filter((p) => p[1].srs.state === "review" && ok(p));
+    session.fresh = session.fresh.filter((p) => p[1].srs.state === "new" && ok(p));
+    session.learning = session.learning.filter((p) => p[1].srs.state !== "review" && p[1].srs.state !== "new" && ok(p));
+    if (session.current && !ok(session.current)) { session.current = null; session.revealed = false; session.stale = true; }
   }
 
   async function connect() {
@@ -632,6 +699,7 @@
     if (S.serverAudio[mid]) { queue("delaudio:" + mid, 500); delete S.serverAudio[mid]; }
     if (S.pods.items[mid]) { delete S.pods.items[mid]; await savePods(); }
     S.user.custom = S.user.custom.filter((c) => c.id !== mid);
+    S.user.deletedCustom = [...(S.user.deletedCustom || []), mid];
     rebuildMods();
     await saveUser();
     toast("Topic deleted");
@@ -1399,13 +1467,14 @@
   /* ================= boot ================= */
   async function boot() {
     try {
-      const [user, pods, outbox, decks, blobKeys] = await Promise.all([
-        idb.get("kv", "user"), idb.get("kv", "pods"), idb.get("kv", "outbox"), idb.entries("decks"), idb.keys("blobs"),
+      const [user, pods, outbox, decks, blobKeys, base] = await Promise.all([
+        idb.get("kv", "user"), idb.get("kv", "pods"), idb.get("kv", "outbox"), idb.entries("decks"), idb.keys("blobs"), idb.get("kv", "base"),
       ]);
       if (user) S.user = normalizeUser(user);
       rebuildMods();
       if (pods) S.pods = normalizePods(pods);
       if (Array.isArray(outbox)) S.outbox = new Map(outbox);
+      if (base && typeof base === "object") S.base = base;
       for (const [k, v] of decks) S.decks[k] = normalizeDeck(v);
       for (const k of blobKeys) if (String(k).startsWith("audio/")) S.localAudio.add(String(k).slice(6));
     } catch (e) {
@@ -1420,10 +1489,19 @@
     await connect();
     // re-render with whatever came from the server, unless mid-study
     if (!location.hash.startsWith("#/study")) route();
+    // Coming back to the tab (or every 2 minutes while it's open): pick up changes from other devices.
+    const refresh = async () => {
+      if (S.syncing || !S.online) return;
+      await connect();
+      const h = location.hash;
+      if (h.startsWith("#/study")) { if (session && session.stale) { session.stale = false; route(); } }
+      else if (h === "" || h === "#/" || h === "#/podcasts") route();
+    };
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "hidden") flush();
-      else if (Date.now() - S.lastSync > 5 * 60000 && !location.hash.startsWith("#/study")) connect().then(() => !location.hash.startsWith("#/study") && !location.hash.startsWith("#/m/") && route());
+      else if (Date.now() - S.lastSync > 60000) refresh();
     });
+    setInterval(() => { if (document.visibilityState === "visible") refresh(); }, 120000);
     window.addEventListener("online", () => connect());
   }
   boot();

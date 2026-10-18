@@ -40,7 +40,7 @@ Run locally with `npx wrangler dev`.
 - **Podcasts** have their own schedule, separate from cards. After a listen, rate it Felt new, Familiar or Knew it well; the next listen is set for before you'd forget, and the gap grows when you know it (up to 6 months). The Podcasts tab lists what's due, new and coming up. Playback speed and position are remembered.
 - **Your own content.** Podcasts → "Add your own podcast", or Library → Miscellaneous → "New topic", creates a topic of your own. Topics work like modules: a podcast slot and a flashcard slot, same schedules, synced. Rename or delete from the topic page.
 - **Importing.** Re-importing the same Anki deck updates changed cards and adds new ones without touching your progress. Text files: one card per line, front and back separated by a tab or comma.
-- **Storage.** Everything is saved in the browser first (IndexedDB), then synced to R2 when you're signed in. Changes made offline or signed out wait in a queue and sync later.
+- **Storage and sync.** Everything is saved in the browser first (IndexedDB), then synced to R2 when you're signed in. Changes upload a few seconds after you make them; nothing to push by hand. Each device pulls the latest when it opens, when you come back to the tab, and every 2 minutes while it's open. When two devices changed the same module, they merge card by card (the most recent review of each card wins), so one device never overwrites another. Changes made offline or signed out wait in a queue and sync later.
 - **Backup.** Settings has a JSON backup of all card text and review history (images and audio stay in R2).
 
 R2 layout: `flashcards/user.json`, `flashcards/podcasts.json`, `flashcards/cards/{module}.json`, `audio/{module}`, `media/{module}/{file}`.
