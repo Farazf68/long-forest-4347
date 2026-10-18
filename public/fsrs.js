@@ -59,27 +59,61 @@
     return { state: "new", step: 0, due: 0, s: 0, d: 0, reps: 0, lapses: 0, last: 0 };
   }
 
-  function reviewInterval(s, retention) {
-    const days = Math.max(1, Math.round(intervalDays(s, retention)));
-    return Math.min(days, 365 * 2) * DAY;
+  const MAX_DAYS = 365 * 2;
+  function rawDays(s, retention) {
+    return Math.min(MAX_DAYS, Math.max(1, Math.round(intervalDays(s, retention))));
+  }
+  /* Deterministic 0..1 from a seed, so the interval shown on a button is the one you get. */
+  function seeded(seed) {
+    let h = 2166136261;
+    const str = String(seed);
+    for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }
+    h ^= h >>> 13; h = Math.imul(h, 0x5bd1e995); h ^= h >>> 15;
+    return (h >>> 0) / 4294967296;
+  }
+  /* Anki-style fuzz: spreads cards learned together across nearby days. */
+  function fuzz(days, u) {
+    if (days < 2.5) return days;
+    let delta = 1;
+    delta += 0.15 * (Math.min(days, 7) - 2.5);
+    if (days > 7) delta += 0.1 * (Math.min(days, 20) - 7);
+    if (days > 20) delta += 0.05 * (days - 20);
+    const lo = Math.max(2, Math.round(days - delta));
+    const hi = Math.min(MAX_DAYS, Math.round(days + delta));
+    return lo + Math.floor(u * (hi - lo + 1));
+  }
+  /* Keep Hard < Good < Easy by at least a day, before and after fuzz. */
+  function ordered(days) {
+    const o = Object.assign({}, days);
+    if (o[2] != null && o[3] != null) { o[2] = Math.min(o[2], o[3]); o[3] = Math.max(o[3], o[2] + 1); }
+    if (o[3] != null && o[4] != null) o[4] = Math.max(o[4], o[3] + 1);
+    return o;
+  }
+  function spread(days, u) {
+    const f = {};
+    for (const k of Object.keys(days)) f[k] = fuzz(days[k], u);
+    return ordered(f);
   }
 
-  /** Returns the srs object that grading `g` at time `now` would produce. Pure. */
+  /** Returns the srs object that grading `g` at time `now` would produce. Pure.
+   *  opts.retention: target recall (default 0.9). opts.seed: card id, for repeatable fuzz. */
   function next(srs, g, now, opts) {
     const retention = (opts && opts.retention) || 0.9;
     const c = Object.assign(fresh(), srs || {});
     const out = Object.assign({}, c, { last: now });
     const elapsed = c.last ? (now - c.last) / DAY : 0;
+    const u = seeded(`${(opts && opts.seed) || ""}|${c.reps}|${c.lapses}|${c.state}`);
 
     if (c.state === "new") {
       out.d = initDifficulty(g);
       out.s = initStability(g);
       if (g === 1) { out.state = "learning"; out.step = 0; out.due = now + LEARN_STEPS[0]; }
-      else if (g === 2) { out.state = "learning"; out.step = 0; out.due = now + Math.round(LEARN_STEPS[0] * 1.5); }
-      else if (g === 3) {
-        if (LEARN_STEPS.length > 1) { out.state = "learning"; out.step = 1; out.due = now + LEARN_STEPS[1]; }
-        else { out.state = "review"; out.reps = 1; out.due = now + reviewInterval(out.s, retention); }
-      } else { out.state = "review"; out.reps = 1; out.due = now + reviewInterval(out.s, retention); }
+      else if (g === 2) { out.state = "learning"; out.step = 0; out.due = now + Math.round((LEARN_STEPS[0] + LEARN_STEPS[1]) / 2); }
+      else if (g === 3) { out.state = "learning"; out.step = 1; out.due = now + LEARN_STEPS[1]; }
+      else {
+        out.state = "review"; out.reps = 1;
+        out.due = now + fuzz(rawDays(out.s, retention), u) * DAY;
+      }
       return out;
     }
 
@@ -87,15 +121,16 @@
       const steps = c.state === "learning" ? LEARN_STEPS : RELEARN_STEPS;
       out.d = nextDifficulty(c.d || initDifficulty(3), g);
       out.s = stabilityShortTerm(c.s || initStability(3), g);
-      if (g === 1) { out.step = 0; out.due = now + steps[0]; }
-      else if (g === 2) { out.step = c.step; out.due = now + Math.round(steps[Math.min(c.step, steps.length - 1)] * 1.5); }
-      else if (g === 3) {
-        if (c.step + 1 < steps.length) { out.step = c.step + 1; out.due = now + steps[out.step]; }
-        else { out.state = "review"; out.step = 0; out.reps = c.reps + 1; out.due = now + reviewInterval(out.s, retention); }
-      } else {
-        out.state = "review"; out.step = 0; out.reps = c.reps + 1;
-        out.due = now + reviewInterval(Math.max(out.s, initStability(4)), retention);
-      }
+      if (g === 1) { out.step = 0; out.due = now + steps[0]; return out; }
+      if (g === 2) { out.step = c.step; out.due = now + Math.round(steps[Math.min(c.step, steps.length - 1)] * 1.5); return out; }
+      if (g === 3 && c.step + 1 < steps.length) { out.step = c.step + 1; out.due = now + steps[out.step]; return out; }
+      // graduate: Good and Easy intervals computed together so Easy is always longer
+      const sGood = stabilityShortTerm(c.s || initStability(3), 3);
+      const sEasy = Math.max(stabilityShortTerm(c.s || initStability(3), 4), initStability(4));
+      const days = spread({ 3: rawDays(sGood, retention), 4: rawDays(sEasy, retention) }, u);
+      if (g === 4) out.s = sEasy;
+      out.state = "review"; out.step = 0; out.reps = c.reps + 1;
+      out.due = now + days[g] * DAY;
       return out;
     }
 
@@ -107,11 +142,13 @@
       out.lapses = c.lapses + 1;
       out.state = "relearning"; out.step = 0;
       out.due = now + RELEARN_STEPS[0];
-    } else {
-      out.s = stabilityAfterRecall(c.d, c.s, r, g);
-      out.reps = c.reps + 1;
-      out.due = now + reviewInterval(out.s, retention);
+      return out;
     }
+    const st = { 2: stabilityAfterRecall(c.d, c.s, r, 2), 3: stabilityAfterRecall(c.d, c.s, r, 3), 4: stabilityAfterRecall(c.d, c.s, r, 4) };
+    const days = spread(ordered({ 2: rawDays(st[2], retention), 3: rawDays(st[3], retention), 4: rawDays(st[4], retention) }), u);
+    out.s = st[g];
+    out.reps = c.reps + 1;
+    out.due = now + days[g] * DAY;
     return out;
   }
 

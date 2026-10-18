@@ -20,14 +20,29 @@
   const { DAY, MIN } = FSRS;
   const ROLLOVER_H = 4; // a study day runs 4am to 4am, like Anki
   const LEARN_AHEAD = 20 * MIN;
-  const POD_LADDER = [1, 3, 7, 14, 30, 60, 120]; // days between podcast listens
+  const POD_FIRST = { 1: 1, 3: 2, 4: 4 };      // days until the 2nd listen, by rating
+  const POD_GROW = { 1: 0.5, 3: 2.2, 4: 3.5 };    // how the gap changes after each rated listen
+  const POD_MAX = 180;
+  const POD_LADDER = [1, 3, 7, 14, 30, 60, 120]; // old fixed schedule, only used to convert old data
+  const POD_RATINGS = [[1, "Felt new"], [3, "Familiar"], [4, "Knew it well"]];
+  const LATER_MS = 24 * 3600 * 1000;              // "Later" hides a card this long
+  const AHEAD_DAYS = 3;                           // "Review ahead" pulls in cards due this many days early
   const SQL_CDN = "https://cdn.jsdelivr.net/npm/sql.js@1.11.0/dist/";
   const ZSTD_CDN = "https://cdn.jsdelivr.net/npm/fzstd@0.1.1/umd/index.js";
 
+  /* Chapters come from chapters.js, plus a Miscellaneous chapter of your own topics. */
   const CH = window.CHAPTERS;
+  const MISC = { id: "misc", num: "", name: "Miscellaneous", modules: [] };
+  let CHAPS = [];
   const MODS = [];
   const MOD = {};
-  CH.forEach((c) => c.modules.forEach((m) => { const o = { ...m, ch: c, idx: MODS.length }; MODS.push(o); MOD[m.id] = o; }));
+  function rebuildMods() {
+    MODS.length = 0;
+    for (const k of Object.keys(MOD)) delete MOD[k];
+    MISC.modules = (S.user.custom || []).map((c) => ({ id: c.id, name: c.name, custom: true }));
+    CHAPS = [...CH, MISC];
+    CHAPS.forEach((c) => c.modules.forEach((m) => { const o = { ...m, ch: c, idx: MODS.length }; MODS.push(o); MOD[m.id] = o; }));
+  }
 
   function dayStart(ts = Date.now()) {
     const d = new Date(ts);
@@ -110,7 +125,7 @@
   const DEFAULT_SETTINGS = { newPerDay: 20, retention: 0.9, theme: "auto" };
   const S = {
     decks: {},
-    user: { settings: { ...DEFAULT_SETTINGS }, log: {}, updatedAt: 0 },
+    user: { settings: { ...DEFAULT_SETTINGS }, log: {}, custom: [], updatedAt: 0 },
     pods: { items: {}, updatedAt: 0 },
     localAudio: new Set(),
     serverAudio: {},
@@ -136,6 +151,7 @@
       type: c.type === "cloze" || c.kind === "cloze" ? "cloze" : "basic",
       srs: validSrs(c.srs) ? c.srs : FSRS.fresh(),
       added: Number(c.added) || 0,
+      buriedUntil: Number(c.buriedUntil) || 0,
     })).filter((c) => c.front);
     return { cards, updatedAt: Number(d && d.updatedAt) || 0 };
   }
@@ -148,13 +164,21 @@
         theme: ["auto", "light", "dark"].includes(s.theme) ? s.theme : "auto",
       },
       log: u && u.log && typeof u.log === "object" && !Array.isArray(u.log) ? u.log : {},
+      custom: Array.isArray(u && u.custom)
+        ? u.custom.filter((c) => c && /^misc-[a-z0-9-]{1,60}$/.test(c.id) && typeof c.name === "string")
+            .map((c) => ({ id: c.id, name: c.name.slice(0, 120), created: Number(c.created) || 0 }))
+        : [],
       updatedAt: Number(u && u.updatedAt) || 0,
     };
   }
   function normalizePods(p) {
     const items = {};
     const src = p && p.items && typeof p.items === "object" ? p.items : {};
-    for (const [k, v] of Object.entries(src)) if (MOD[k] && v && typeof v.due === "number") items[k] = v;
+    for (const [k, v] of Object.entries(src)) {
+      if (!v || typeof v.due !== "number") continue;
+      const ivl = Number(v.ivl) || POD_LADDER[Math.min(Number(v.step) || 0, POD_LADDER.length - 1)];
+      items[k] = { ivl, due: v.due, last: Number(v.last) || 0, count: Number(v.count) || 1 };
+    }
     return { items, updatedAt: Number(p && p.updatedAt) || 0 };
   }
 
@@ -265,7 +289,7 @@
     const pending = (op) => S.outbox.has(op);
     if (man.user && man.user.updatedAt > S.user.updatedAt && !pending("user")) {
       const u = await getJSON("/api/flashcards/user");
-      if (u) { S.user = normalizeUser(u); await idb.put("kv", "user", S.user); applyTheme(); }
+      if (u) { S.user = normalizeUser(u); await idb.put("kv", "user", S.user); rebuildMods(); applyTheme(); }
     } else if (S.user.updatedAt > ((man.user && man.user.updatedAt) || 0)) queue("user");
     if (man.podcasts && man.podcasts.updatedAt > S.pods.updatedAt && !pending("pods")) {
       const p = await getJSON("/api/flashcards/podcasts");
@@ -338,32 +362,46 @@
     const extra = t ? t.extraNew || 0 : 0;
     return Math.max(0, S.user.settings.newPerDay + extra - used);
   }
+  const isLater = (card, now) => card.buriedUntil > now;
   function counts(mid) {
-    const end = nextDayStart();
-    const c = { total: 0, review: 0, learning: 0, new: 0, unseen: 0, mature: 0, young: 0 };
+    const now = Date.now();
+    const end = nextDayStart(now);
+    const aheadEnd = addDays(end, AHEAD_DAYS);
+    const c = { total: 0, review: 0, learning: 0, new: 0, unseen: 0, mature: 0, young: 0, later: 0, ahead: 0 };
     for (const [, card] of cardsOf(mid)) {
       c.total++;
       const s = card.srs;
+      if (s.state === "review" && s.s >= 21) c.mature++;
+      if (isLater(card, now)) { c.later++; continue; }
       if (s.state === "new") { c.unseen++; continue; }
-      if (s.state === "review") { if (s.due < end) c.review++; if (s.s >= 21) c.mature++; else c.young++; }
+      if (s.state === "review") { if (s.due < end) c.review++; else if (s.due < aheadEnd) c.ahead++; if (s.s < 21) c.young++; }
       else { if (s.due < end) c.learning++; c.young++; }
     }
     c.new = Math.min(c.unseen, newLimitLeft());
     c.due = c.review + c.learning + c.new;
+    c.moreNew = c.unseen - c.new; // new cards beyond today's limit
     return c;
   }
 
-  function buildSession(mid) {
-    const end = nextDayStart();
+  /* opts.ahead: also include review cards due in the next AHEAD_DAYS days (no new cards). */
+  function buildSession(mid, opts = {}) {
+    const now = Date.now();
+    const today0 = nextDayStart(now);
+    const end = opts.ahead ? addDays(today0, AHEAD_DAYS) : today0;
     const reviews = [], learning = [], fresh = [];
     for (const pair of cardsOf(mid)) {
-      const s = pair[1].srs;
+      const card = pair[1], s = card.srs;
+      if (isLater(card, now)) continue;
       if (s.state === "new") fresh.push(pair);
       else if (s.state === "review") { if (s.due < end) reviews.push(pair); }
-      else if (s.due < end) learning.push(pair);
+      else if (s.due < today0) learning.push(pair);
     }
     reviews.sort((a, b) => a[1].srs.due - b[1].srs.due);
-    return { mid, reviews, learning, fresh: fresh.slice(0, newLimitLeft()), sinceNew: 0, done: 0, started: Date.now(), history: [], current: null, revealed: false, shownAt: 0 };
+    return {
+      mid, ahead: Boolean(opts.ahead), reviews, learning,
+      fresh: opts.ahead ? [] : fresh.slice(0, newLimitLeft()),
+      sinceNew: 0, done: 0, started: now, history: [], current: null, revealed: false, shownAt: 0,
+    };
   }
   function pickNext(sess) {
     const now = Date.now();
@@ -389,19 +427,28 @@
     };
   }
 
+  function snapshot(sess, pair) {
+    return {
+      pair, prev: pair[1].srs, prevLater: pair[1].buriedUntil || 0, log: { ...today() },
+      reviews: [...sess.reviews], learning: [...sess.learning], fresh: [...sess.fresh], sinceNew: sess.sinceNew, done: sess.done,
+    };
+  }
+  function remember(sess, pair) { sess.history.push(snapshot(sess, pair)); if (sess.history.length > 50) sess.history.shift(); }
+  function dropFromSession(sess, pair) {
+    for (const arr of [sess.reviews, sess.fresh, sess.learning]) { const i = arr.indexOf(pair); if (i >= 0) arr.splice(i, 1); }
+  }
+
   async function grade(sess, g) {
     const pair = sess.current; if (!pair) return;
     const [mid, card] = pair;
     const now = Date.now();
     const prev = card.srs;
     const t = today();
-    const snapshot = { pair, prev, log: { ...t }, reviews: [...sess.reviews], learning: [...sess.learning], fresh: [...sess.fresh], sinceNew: sess.sinceNew, done: sess.done };
-    sess.history.push(snapshot); if (sess.history.length > 50) sess.history.shift();
+    remember(sess, pair);
 
-    card.srs = FSRS.next(prev, g, now, { retention: S.user.settings.retention });
-
-    const rm = (arr) => { const i = arr.indexOf(pair); if (i >= 0) arr.splice(i, 1); };
-    rm(sess.reviews); rm(sess.fresh); rm(sess.learning);
+    card.srs = FSRS.next(prev, g, now, { retention: S.user.settings.retention, seed: card.id });
+    card.buriedUntil = 0;
+    dropFromSession(sess, pair);
     if (card.srs.state !== "review" && card.srs.due < nextDayStart(now)) sess.learning.push(pair);
 
     t.reviews++;
@@ -414,14 +461,34 @@
     await saveDeck(mid);
     await saveUser();
   }
+
+  /* "Later": hide the card for 24 hours. Its schedule is untouched, and new cards
+     don't count against today's new-card limit until you actually answer them. */
+  async function later(sess) {
+    const pair = sess.current; if (!pair) return;
+    remember(sess, pair);
+    pair[1].buriedUntil = Date.now() + LATER_MS;
+    dropFromSession(sess, pair);
+    await saveDeck(pair[0]);
+  }
+
   async function undo(sess) {
     const h = sess.history.pop(); if (!h) return false;
     h.pair[1].srs = h.prev;
+    h.pair[1].buriedUntil = h.prevLater;
     S.user.log[dayKey()] = h.log;
     Object.assign(sess, { reviews: h.reviews, learning: h.learning, fresh: h.fresh, sinceNew: h.sinceNew, done: h.done, current: h.pair, revealed: false });
     await saveDeck(h.pair[0]);
     await saveUser();
     return true;
+  }
+
+  /* Start studying: optionally add extra new cards to today, or review ahead. */
+  async function startStudy(mid, { moreNew = 0, ahead = false } = {}) {
+    if (moreNew) { today().extraNew = (today().extraNew || 0) + moreNew; await saveUser(); }
+    session = buildSession(mid, { ahead });
+    const target = mid ? `#/study/${mid}` : "#/study";
+    if (location.hash === target) renderStudy(mid); else location.hash = target;
   }
 
   /* ================= card rendering ================= */
@@ -486,6 +553,7 @@
     window.scrollTo(0, 0);
     if (!page) return renderToday();
     if (page === "library") return renderLibrary();
+    if (page === "podcasts") return renderPodcasts();
     if (page === "m" && MOD[decodeURIComponent(arg || "")]) return renderModule(decodeURIComponent(arg));
     if (page === "study") return renderStudy(arg ? decodeURIComponent(arg) : null);
     if (page === "stats") return renderStats();
@@ -494,18 +562,115 @@
   }
 
   /* ================= Today ================= */
+  const hasAudio = (mid) => S.localAudio.has(mid) || Boolean(S.serverAudio[mid]);
   function podsDue() {
     const end = nextDayStart();
-    const due = [], fresh = [];
+    const due = [], fresh = [], upcoming = [];
     for (const m of MODS) {
       if (!hasAudio(m.id)) continue;
       const p = S.pods.items[m.id];
       if (!p) fresh.push(m);
       else if (p.due < end) due.push(m);
+      else upcoming.push(m);
     }
-    return { due, fresh };
+    const byDue = (a, b) => S.pods.items[a.id].due - S.pods.items[b.id].due;
+    return { due: due.sort(byDue), fresh, upcoming: upcoming.sort(byDue) };
   }
-  const hasAudio = (mid) => S.localAudio.has(mid) || Boolean(S.serverAudio[mid]);
+  function podLabel(mid) {
+    const p = S.pods.items[mid];
+    if (!p) return "Not heard yet";
+    const late = Math.round((dayStart() - dayStart(p.due)) / DAY);
+    if (late > 1) return `Due ${late} days ago`;
+    if (late === 1) return "Due yesterday";
+    if (p.due < nextDayStart()) return "Due today";
+    return `Next listen ${relDay(p.due)}`;
+  }
+  /* What the next listen date would be after rating this listen 1 (felt new), 3 (familiar) or 4 (knew it well).
+     The gap grows each time you know it, shrinks when it felt new, and listening early earns less credit. */
+  function podNext(mid, r, now = Date.now()) {
+    const p = S.pods.items[mid];
+    let ivl;
+    if (!p) ivl = POD_FIRST[r];
+    else {
+      const base = Math.max(1, p.ivl || 1);
+      const credit = Math.min(1, Math.max(0.25, (now - p.last) / DAY / base));
+      ivl = r === 1 ? base * POD_GROW[1] : base * (1 + (POD_GROW[r] - 1) * credit);
+    }
+    ivl = Math.min(POD_MAX, Math.max(1, Math.round(ivl)));
+    return { ivl, due: addDays(dayStart(now), ivl), last: now, count: (p ? p.count : 0) + 1 };
+  }
+  async function rateListen(mid, r) {
+    S.pods.items[mid] = podNext(mid, r);
+    await savePods();
+    lsSet("rd_pos_" + mid, null);
+    toast(`Got it. Next listen ${relDay(S.pods.items[mid].due)}.`);
+    const player = $("#player");
+    if (location.hash === `#/m/${mid}` && (!player || player.paused)) renderModule(mid);
+    else { const st = $("#pod-head-status"); if (st) st.textContent = podLabel(mid); }
+  }
+
+  /* ---------- your own topics (Miscellaneous) ---------- */
+  async function createTopic(name) {
+    const id = "misc-" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    S.user.custom.push({ id, name: name.slice(0, 120), created: Date.now() });
+    rebuildMods();
+    await saveUser();
+    return id;
+  }
+  function askTopicName(def = "") {
+    const n = prompt("Name this topic (for example: MRI physics)", def);
+    return n && n.trim() ? n.trim() : null;
+  }
+  async function deleteTopic(mid) {
+    const m = MOD[mid];
+    if (!m || !m.custom) return;
+    if (!confirm(`Delete “${m.name}” with its cards and podcast? This can't be undone.`)) return;
+    if (S.decks[mid]) { delete S.decks[mid]; await idb.del("decks", mid); queue("deldeck:" + mid, 500); }
+    for (const k of await idb.keys("blobs")) if (String(k).startsWith(`media/${mid}/`)) { await idb.del("blobs", k); S.outbox.delete("media:" + String(k).slice(6)); }
+    if (S.localAudio.has(mid)) { await idb.del("blobs", "audio/" + mid); S.localAudio.delete(mid); }
+    S.outbox.delete("audio:" + mid);
+    if (S.serverAudio[mid]) { queue("delaudio:" + mid, 500); delete S.serverAudio[mid]; }
+    if (S.pods.items[mid]) { delete S.pods.items[mid]; await savePods(); }
+    S.user.custom = S.user.custom.filter((c) => c.id !== mid);
+    rebuildMods();
+    await saveUser();
+    toast("Topic deleted");
+    location.hash = "#/library";
+  }
+  function addOwnPodcast() {
+    const inp = $("#file-audio");
+    inp.value = "";
+    inp.onchange = async () => {
+      const f = inp.files[0]; if (!f) return;
+      const guess = f.name.replace(/\.[^.]+$/, "").replace(/[_-]+/g, " ").trim();
+      const name = askTopicName(guess); if (!name) return;
+      const id = await createTopic(name);
+      location.hash = `#/m/${id}`;
+      await new Promise((r) => setTimeout(r, 60));
+      runAudioUpload(id, f);
+    };
+    inp.click();
+  }
+
+  function podRow(m, label) {
+    return `<a class="item" href="#/m/${m.id}">
+      <span class="pod-dot" aria-hidden="true"></span>
+      <span class="t"><b>${esc(m.name)}</b><span class="small muted">${esc(m.ch.name)}</span></span>
+      <span class="meta">${esc(label)}</span><span class="chev" aria-hidden="true">›</span></a>`;
+  }
+  function moreButtons(c, mid) {
+    const out = [];
+    if (c.moreNew > 0) {
+      out.push(`<button class="btn" data-more="10">Learn 10 more new</button>`);
+      if (c.moreNew > 10) out.push(`<button class="btn" data-more="20">Learn 20 more</button>`);
+    }
+    if (!c.review && !c.learning && c.ahead) out.push(`<button class="btn" data-ahead="1" title="Cards due in the next ${AHEAD_DAYS} days">Review ahead (${c.ahead})</button>`);
+    return out.join("");
+  }
+  function wireMore(root, mid) {
+    $$("[data-more]", root).forEach((b) => (b.onclick = () => startStudy(mid, { moreNew: Number(b.dataset.more) })));
+    $$("[data-ahead]", root).forEach((b) => (b.onclick = () => startStudy(mid, { ahead: true })));
+  }
 
   function renderToday() {
     const c = counts(null);
@@ -518,46 +683,40 @@
         <div class="stack">
           <div>
             <h1 class="lede">Start by adding a deck.</h1>
-            <p class="muted" style="margin-top:10px;max-width:52ch">Pick a module in the library, then upload an Anki deck (.apkg) or a podcast. Cards you add show up here on a spaced-repetition schedule.</p>
+            <p class="muted" style="margin-top:10px;max-width:52ch">Pick a module in the library and upload an Anki deck (.apkg) or a podcast. Your own recordings go in <a href="#/podcasts">Podcasts</a>. Everything you add shows up here on a spaced-repetition schedule.</p>
           </div>
-          <div><a class="btn primary lg" href="#/library">Open the library</a></div>
+          <div class="row"><a class="btn primary lg" href="#/library">Open the library</a><a class="btn lg" href="#/podcasts">Add your own podcast</a></div>
           ${!S.authOk && S.online ? `<p class="small muted">Want this on all your devices? <a href="#/settings">Sign in with your admin token</a> first, so uploads go to your Cloudflare storage.</p>` : ""}
         </div>`;
       return;
     }
 
-    const perMod = MODS.map((m) => ({ m, c: S.decks[m.id] ? counts(m.id) : null })).filter((x) => x.c && x.c.review + x.c.learning + (x.c.unseen ? 1 : 0) > 0);
+    const perMod = MODS.map((m) => ({ m, c: S.decks[m.id] ? counts(m.id) : null })).filter((x) => x.c && x.c.review + x.c.learning + x.c.unseen > 0);
     const dueMods = perMod.filter((x) => x.c.review + x.c.learning > 0);
     const nextUp = nextReviewInfo();
 
-    const headline = c.due
-      ? `${plural(c.due, "card")} to study today.`
-      : anyCards ? "You're caught up." : "No cards yet.";
-    const sub = c.due
+    const headline = c.due ? `${plural(c.due, "card")} to study today.` : anyCards ? "You're caught up." : "No cards yet.";
+    let sub = c.due
       ? [c.review && plural(c.review, "review"), c.learning && `${c.learning} learning`, c.new && `${c.new} new`].filter(Boolean).join(", ") + (dueMods.length > 1 ? `, across ${dueMods.length} modules.` : ".")
-      : nextUp ? `Next reviews ${nextUp}.` : "Add cards to a module to get started.";
+      : nextUp ? `Next reviews ${nextUp}.` : anyCards ? "" : "Add cards to a module to get started.";
+    if (c.later) sub += ` ${plural(c.later, "card")} set aside for later.`;
 
     view().innerHTML = `
       <div class="stack">
         <section>
           <h1 class="lede">${headline}</h1>
-          <p class="muted" style="margin-top:8px">${esc(sub)}</p>
+          ${sub.trim() ? `<p class="muted" style="margin-top:8px">${esc(sub.trim())}</p>` : ""}
           <div class="row" style="margin-top:20px">
             ${c.due ? `<a class="btn primary lg" href="#/study">Start studying</a>` : ""}
-            ${!c.due && c.unseen && !c.new ? `<button class="btn" id="more-new">Learn 10 more new cards</button>` : ""}
+            ${moreButtons(c, null)}
           </div>
         </section>
 
         ${pods.due.length || pods.fresh.length ? `
         <section>
-          <div class="section-h"><h2>Podcasts</h2><span class="small muted">${pods.due.length ? `${pods.due.length} due` : ""}</span></div>
+          <div class="section-h"><h2>Listen today</h2><a class="small" href="#/podcasts">All podcasts</a></div>
           <div class="list">
-            ${[...pods.due.map((m) => [m, "Listen again"]), ...pods.fresh.slice(0, 4).map((m) => [m, "Not heard yet"])].map(([m, why]) => `
-              <a class="item" href="#/m/${m.id}">
-                <span class="pod-dot" aria-hidden="true"></span>
-                <span class="t"><b>${esc(m.name)}</b><span class="small muted">${esc(m.ch.name)}</span></span>
-                <span class="meta">${why}</span><span class="chev" aria-hidden="true">›</span>
-              </a>`).join("")}
+            ${[...pods.due.map((m) => podRow(m, podLabel(m.id))), ...pods.fresh.slice(0, 4).map((m) => podRow(m, "New"))].join("")}
           </div>
         </section>` : ""}
 
@@ -574,8 +733,7 @@
           </div>
         </section>` : ""}
       </div>`;
-    const more = $("#more-new");
-    if (more) more.onclick = async () => { today().extraNew = (today().extraNew || 0) + 10; await saveUser(); location.hash = "#/study"; };
+    wireMore(view(), null);
   }
   function nextReviewInfo() {
     let min = Infinity;
@@ -599,14 +757,15 @@
     const lib = $("#lib");
     const draw = (q) => {
       q = (q || "").trim().toLowerCase();
-      lib.innerHTML = CH.map((c) => {
+      lib.innerHTML = CHAPS.map((c) => {
+        const isMisc = c === MISC;
         const mods = MODS.filter((m) => m.ch === c && (!q || m.name.toLowerCase().includes(q) || c.name.toLowerCase().includes(q)));
-        if (!mods.length) return "";
-        let cards = 0, due = 0, audio = 0;
+        if (!mods.length && (q || !isMisc)) return "";
+        let cards = 0, due = 0;
         const rows = mods.map((m) => {
           const k = S.decks[m.id] ? counts(m.id) : null;
           if (k) { cards += k.total; due += k.review + k.learning; }
-          const a = hasAudio(m.id); if (a) audio++;
+          const a = hasAudio(m.id);
           return `<a class="item" href="#/m/${m.id}">
             <span class="t"><b>${esc(m.name)}</b></span>
             <span class="meta">
@@ -615,11 +774,12 @@
               ${k ? `<span>${plural(k.total, "card")}</span>` : ""}
             </span>
             <span class="chev" aria-hidden="true">›</span></a>`;
-        }).join("");
+        }).join("") + (isMisc ? `<button class="item add-topic" type="button" data-new-topic>+ New topic for your own podcasts and cards</button>` : "");
         const isOpen = q || open.has(c.id);
+        const meta = isMisc && !mods.length ? "Your own topics" : cards ? plural(cards, "card") : plural(mods.length, isMisc ? "topic" : "module");
         return `<details class="chap" data-id="${c.id}" ${isOpen ? "open" : ""}>
           <summary><span class="n">${c.num}</span><span>${esc(c.name)}</span>
-            <span class="meta">${due ? `<span class="due" style="color:var(--accent);font-weight:600">${due} due</span>&ensp;` : ""}${cards ? plural(cards, "card") : `${mods.length} modules`}</span>
+            <span class="meta">${due ? `<span class="due" style="color:var(--accent);font-weight:600">${due} due</span>&ensp;` : ""}${meta}</span>
             <span class="arrow" aria-hidden="true">›</span></summary>
           <div class="mods">${rows}</div></details>`;
       }).join("") || `<div class="item muted">No modules match “${esc(q)}”.</div>`;
@@ -628,9 +788,38 @@
         d.open ? open.add(d.dataset.id) : open.delete(d.dataset.id);
         lsSet("rd_open", JSON.stringify([...open]));
       }));
+      $$("[data-new-topic]", lib).forEach((b) => (b.onclick = async () => {
+        const name = askTopicName(); if (!name) return;
+        const id = await createTopic(name);
+        location.hash = `#/m/${id}`;
+      }));
     };
     draw("");
     $("#lib-q").addEventListener("input", (e) => draw(e.target.value));
+  }
+
+  /* ================= Podcasts ================= */
+  function renderPodcasts() {
+    const pods = podsDue();
+    const total = pods.due.length + pods.fresh.length + pods.upcoming.length;
+    const section = (title, list, label) => list.length ? `
+      <section>
+        <div class="section-h"><h2>${title}</h2><span class="small muted">${list.length}</span></div>
+        <div class="list">${list.map((m) => podRow(m, label(m))).join("")}</div>
+      </section>` : "";
+    view().innerHTML = `
+      <div class="stack">
+        <div class="row between">
+          <h1>Podcasts</h1>
+          <button class="btn primary" id="add-pod">Add your own podcast</button>
+        </div>
+        <p class="muted" style="max-width:62ch">After each listen, rate how well you knew it. The next listen is timed for just before you'd start to forget, and the gap grows each time you know it well. Your own recordings go in Miscellaneous, with the same schedule.</p>
+        ${section("Due to listen", pods.due, (m) => podLabel(m.id))}
+        ${section("Not heard yet", pods.fresh, () => "New")}
+        ${section("Coming up", pods.upcoming, (m) => relDay(S.pods.items[m.id].due).replace(/^./, (x) => x.toUpperCase()))}
+        ${!total ? `<div class="card pad empty"><p class="muted">No podcasts yet. Add one to a module from the <a href="#/library">library</a>, or upload your own recording with the button above.</p></div>` : ""}
+      </div>`;
+    $("#add-pod").onclick = addOwnPodcast;
   }
 
   /* ================= Module ================= */
@@ -641,12 +830,16 @@
     const pod = S.pods.items[mid];
     const audio = hasAudio(mid);
     const srvA = S.serverAudio[mid];
+    const podDue = pod && pod.due < nextDayStart();
 
     view().innerHTML = `
       <div class="stack">
         <div>
           <div class="crumb"><a href="#/library">Library</a> › ${esc(m.ch.name)}</div>
-          <h1>${esc(m.name)}</h1>
+          <div class="row between" style="align-items:flex-end">
+            <h1>${esc(m.name)}</h1>
+            ${m.custom ? `<div class="row" style="gap:4px"><button class="btn sm quiet" id="topic-rename">Rename</button><button class="btn sm quiet danger" id="topic-del">Delete topic</button></div>` : ""}
+          </div>
         </div>
 
         ${c && c.total ? `
@@ -658,14 +851,19 @@
               <div class="stat"><b>${c.mature}</b><span>mature</span></div>
               <div class="stat"><b>${c.total}</b><span>cards</span></div>
             </div>
-            ${c.due ? `<a class="btn primary" href="#/study/${mid}">Study ${plural(c.due, "card")}</a>` : `<span class="small muted" style="align-self:center">Nothing due in this module today.</span>`}
+            <div class="row" style="gap:8px">
+              ${c.due ? `<a class="btn primary" href="#/study/${mid}">Study ${plural(c.due, "card")}</a>` : ""}
+              ${moreButtons(c, mid)}
+              ${!c.due && !c.moreNew && !c.ahead ? `<span class="small muted" style="align-self:center">Nothing due in this module today.</span>` : ""}
+            </div>
           </div>
+          ${c.later ? `<p class="small muted" style="margin-top:12px">${plural(c.later, "card")} set aside with Later. They come back within 24 hours. <button class="btn sm quiet" id="unlater">Bring back now</button></p>` : ""}
         </section>` : ""}
 
         <section>
-          <div class="section-h"><h2>Podcast</h2>${pod ? `<span class="small muted">Heard ${plural(pod.count, "time")}, next listen ${relDay(pod.due)}</span>` : ""}</div>
+          <div class="section-h"><h2>Podcast</h2>${audio ? `<span class="small muted" id="pod-head-status">${podLabel(mid)}</span>` : ""}</div>
           ${audio ? `
-          <div class="card pad">
+          <div class="card pad${podDue ? " due-ring" : ""}">
             <div class="row between">
               <span class="small muted" id="pod-name">${esc((srvA && srvA.filename) || "Podcast")}${srvA && srvA.size ? `, ${fmtBytes(srvA.size)}` : ""}</span>
               <div class="row" style="gap:4px" role="group" aria-label="Playback speed">
@@ -673,12 +871,15 @@
               </div>
             </div>
             <audio id="player" controls preload="metadata"></audio>
-            <div class="row between" style="margin-top:12px">
-              <button class="btn sm" id="pod-done">${pod && pod.due < nextDayStart() ? "Mark as listened" : pod ? "Listened again" : "Mark as listened"}</button>
-              <div class="row" style="gap:4px">
-                <button class="btn sm quiet" id="pod-replace">Replace</button>
-                <button class="btn sm quiet danger" id="pod-del">Remove</button>
+            <div class="rate-pod" id="rate-pod">
+              <p class="small">${pod ? `Heard ${plural(pod.count, "time")}. ` : ""}Finished listening? Rate how well you knew it to schedule the next listen.</p>
+              <div class="pod-rate">
+                ${POD_RATINGS.map(([r, l]) => `<button class="btn sm" data-pr="${r}">${l}<span class="muted">&ensp;${FSRS.fmtSpan(podNext(mid, r).ivl * DAY)}</span></button>`).join("")}
               </div>
+            </div>
+            <div class="row" style="margin-top:10px;gap:4px;justify-content:flex-end">
+              <button class="btn sm quiet" id="pod-replace">Replace audio</button>
+              <button class="btn sm quiet danger" id="pod-del">Remove</button>
             </div>
             <div class="status" id="pod-status"></div>
           </div>` : `
@@ -706,6 +907,18 @@
         </section>
       </div>`;
 
+    if (m.custom) {
+      $("#topic-rename").onclick = async () => {
+        const n = askTopicName(m.name); if (!n) return;
+        const t = S.user.custom.find((x) => x.id === mid); if (t) t.name = n.slice(0, 120);
+        rebuildMods(); await saveUser(); renderModule(mid);
+      };
+      $("#topic-del").onclick = () => deleteTopic(mid);
+    }
+    if (c && c.total) wireMore(view(), mid);
+    const ul = $("#unlater");
+    if (ul) ul.onclick = async () => { for (const card of deck.cards) card.buriedUntil = 0; await saveDeck(mid); renderModule(mid); };
+
     /* --- cards --- */
     const cardFile = $("#file-cards");
     $("#card-pick").onclick = () => { cardFile.value = ""; cardFile.onchange = () => cardFile.files[0] && runImport(mid, cardFile.files[0]); cardFile.click(); };
@@ -714,7 +927,7 @@
       drawCardList(mid);
       $("#card-reset").onclick = async () => {
         if (!confirm(`Reset progress for all ${c.total} cards in “${m.name}”? They'll all become new again.`)) return;
-        for (const card of deck.cards) card.srs = FSRS.fresh();
+        for (const card of deck.cards) { card.srs = FSRS.fresh(); card.buriedUntil = 0; }
         await saveDeck(mid); toast("Progress reset"); renderModule(mid);
       };
       $("#card-del").onclick = async () => {
@@ -746,6 +959,7 @@
       lsSet("rd_pos_" + mid, null);
       toast("Podcast removed"); renderModule(mid);
     };
+    $$("[data-pr]").forEach((b) => (b.onclick = () => rateListen(mid, Number(b.dataset.pr))));
     const player = $("#player");
     activeAudio = player;
     (async () => {
@@ -765,26 +979,13 @@
     });
     let lastSave = 0;
     player.addEventListener("timeupdate", () => { if (Date.now() - lastSave > 3000) { lastSave = Date.now(); lsSet("rd_pos_" + mid, String(player.currentTime)); } });
-    player.addEventListener("ended", () => { lsSet("rd_pos_" + mid, null); markListened(mid, true); });
+    player.addEventListener("ended", () => {
+      lsSet("rd_pos_" + mid, null);
+      const box = $("#rate-pod");
+      if (box) { box.classList.remove("flash"); void box.offsetWidth; box.classList.add("flash"); box.scrollIntoView({ block: "center", behavior: "smooth" }); }
+      toast("Finished. How well did you know it?");
+    });
     player.addEventListener("error", () => { const st = $("#pod-status"); if (st && player.src) { st.textContent = "This audio couldn't be played. Try replacing it with an MP3 or M4A file."; st.classList.add("err"); } });
-    $("#pod-done").onclick = () => markListened(mid, false);
-  }
-
-  async function markListened(mid, auto) {
-    const now = Date.now();
-    const p = S.pods.items[mid];
-    // listening early (before it's due) doesn't advance the ladder
-    if (p && p.due >= nextDayStart(now) && auto) return;
-    const step = p ? (p.due < nextDayStart(now) ? Math.min(p.step + 1, POD_LADDER.length - 1) : p.step) : 0;
-    S.pods.items[mid] = { step, due: addDays(dayStart(now), POD_LADDER[step]), last: now, count: (p ? p.count : 0) + 1 };
-    await savePods();
-    toast(`Next listen ${relDay(S.pods.items[mid].due)}`);
-    if (location.hash === `#/m/${mid}`) {
-      const pos = $("#player") ? $("#player").currentTime : 0;
-      const playing = $("#player") && !$("#player").paused;
-      if (!playing) renderModule(mid);
-      else if (pos) { /* don't interrupt playback */ }
-    }
   }
 
   function drawCardList(mid) {
@@ -792,13 +993,14 @@
     const cards = S.decks[mid].cards;
     const LIMIT = 40;
     let showAll = false;
-    const state = (s) => s.state === "new" ? "New" : s.state === "review" ? `Due ${relDay(s.due)}` : "Learning";
+    const now = Date.now();
+    const state = (s, c) => isLater(c, now) ? "Later" : s.state === "new" ? "New" : s.state === "review" ? `Due ${relDay(s.due)}` : "Learning";
     const draw = () => {
       const shown = showAll ? cards : cards.slice(0, LIMIT);
       list.innerHTML = shown.map((c, i) => `
         <details class="chap" data-i="${i}">
           <summary style="font-weight:400"><span class="t" style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(textOf(c.front).slice(0, 140)) || "<i>Image</i>"}</span>
-          <span class="meta">${state(c.srs)}</span></summary>
+          <span class="meta">${state(c.srs, c)}</span></summary>
           <div class="mods" style="padding:14px 16px"></div>
         </details>`).join("") + (cards.length > LIMIT && !showAll ? `<button class="item btn quiet" style="width:100%;border-radius:0;justify-content:center" id="show-all">Show all ${cards.length} cards</button>` : "");
       $$("details", list).forEach((d) => d.addEventListener("toggle", () => {
@@ -948,24 +1150,23 @@
     const showDone = () => {
       sess.finished = true;
       const mins = Math.max(1, Math.round((Date.now() - sess.started) / 60000));
-      const later = sess.learning.length;
+      const waiting = sess.learning.length;
       const c = counts(mid);
       stage.innerHTML = `
         <div class="done">
           <h1>${sess.done ? "Done for now." : "Nothing to study right now."}</h1>
           <p class="muted">${sess.done ? `${plural(sess.done, "card")} in ${plural(mins, "minute")}.` : ""}
-          ${later ? ` ${plural(later, "card")} will come back later today.` : ""}</p>
+          ${waiting ? ` ${plural(waiting, "card")} will come back later today.` : ""}</p>
           <div class="row" style="margin-top:22px">
             <a class="btn primary" href="${back}">${mid ? "Back to module" : "Back to today"}</a>
-            ${c.unseen && !c.new ? `<button class="btn" id="more">Learn 10 more new cards</button>` : ""}
+            ${moreButtons(c, mid)}
             ${sess.history.length ? `<button class="btn quiet" id="undo-last">Undo last card</button>` : ""}
           </div>
         </div>`;
       gbar.style.display = "none";
       $("#prog").style.width = "100%";
       $("#left").textContent = "";
-      const more = $("#more");
-      if (more) more.onclick = async () => { today().extraNew = (today().extraNew || 0) + 10; await saveUser(); session = null; renderStudy(mid); };
+      wireMore(stage, mid);
       const u = $("#undo-last");
       if (u) u.onclick = async () => { if (await undo(sess)) { sess.finished = false; gbar.style.display = ""; draw(); } };
     };
@@ -977,7 +1178,7 @@
       const [cmid, card] = pair;
       const r = remaining(sess);
       const left = r.new + r.learning + r.review;
-      $("#left").innerHTML = `<span style="color:var(--easy)">${r.new}</span>&ensp;<span style="color:var(--again)">${r.learning}</span>&ensp;<span style="color:var(--good)">${r.review}</span>`;
+      $("#left").innerHTML = `${sess.ahead ? `<span style="margin-right:10px">Reviewing ahead</span>` : ""}<span style="color:var(--easy)">${r.new}</span>&ensp;<span style="color:var(--again)">${r.learning}</span>&ensp;<span style="color:var(--good)">${r.review}</span>`;
       $("#left").title = `${r.new} new, ${r.learning} learning, ${r.review} review`;
       $("#prog").style.width = `${Math.min(100, (sess.done / Math.max(1, sess.done + left)) * 100)}%`;
 
@@ -986,21 +1187,27 @@
       const front = sanitize(card.front);
       const backHtml = sanitize(card.back);
       stage.innerHTML = `
-        <article class="scard" aria-live="polite">
+        <article class="scard${sess.revealed ? "" : " tap"}" aria-live="polite" ${sess.revealed ? "" : `title="Tap to show the answer"`}>
           <div class="side">${sess.revealed && isCloze ? backHtml : front}</div>
           ${sess.revealed && !isCloze ? `<div class="side">${backHtml}</div>` : ""}
-          ${!mid ? `<div class="tagline">${esc(m.ch.name)} › ${esc(m.name)}</div>` : ""}
+          ${!mid && m ? `<div class="tagline">${esc(m.ch.name)} › ${esc(m.name)}</div>` : ""}
         </article>
-        ${sess.history.length ? `<div class="row" style="margin-top:10px;justify-content:flex-end"><button class="btn sm quiet" id="undo">Undo <span class="k">Z</span></button></div>` : ""}`;
+        <div class="row" style="margin-top:10px;justify-content:space-between">
+          <button class="btn sm quiet" id="later" title="Hide this card for 24 hours. Its schedule doesn't change.">Later <span class="k">L</span></button>
+          ${sess.history.length ? `<button class="btn sm quiet" id="undo">Undo <span class="k">Z</span></button>` : ""}
+        </div>`;
       hydrate(stage, cmid);
+      $("#later").onclick = doLater;
       const u = $("#undo"); if (u) u.onclick = doUndo;
+      const art = stage.querySelector(".scard");
+      art.onclick = (e) => { if (!sess.revealed && !e.target.closest("a,button")) reveal(); };
 
       if (!sess.revealed) {
         sess.shownAt = Date.now();
         gbar.innerHTML = `<div class="grade-in one"><button class="btn primary lg" id="reveal">Show answer <span class="k">Space</span></button></div>`;
         $("#reveal").onclick = reveal;
       } else {
-        const pv = FSRS.previews(card.srs, Date.now(), { retention: S.user.settings.retention });
+        const pv = FSRS.previews(card.srs, Date.now(), { retention: S.user.settings.retention, seed: card.id });
         const names = { 1: ["again", "Again"], 2: ["hard", "Hard"], 3: ["good", "Good"], 4: ["easy", "Easy"] };
         gbar.innerHTML = `<div class="grade-in">${[1, 2, 3, 4].map((g) => `<button class="gbtn ${names[g][0]}" data-g="${g}"><b>${names[g][1]}</b><span>${FSRS.fmtSpan(pv[g])}&ensp;<span class="k" style="font-size:10px">${g}</span></span></button>`).join("")}</div>`;
         $$("[data-g]", gbar).forEach((b) => (b.onclick = () => doGrade(Number(b.dataset.g))));
@@ -1013,6 +1220,13 @@
       sess.current = null; sess.revealed = false;
       draw();
     };
+    const doLater = async () => {
+      if (!sess.current) return;
+      await later(sess);
+      sess.current = null; sess.revealed = false;
+      toast("Set aside. It comes back in 24 hours.");
+      draw();
+    };
     const doUndo = async () => { if (await undo(sess)) { sess.finished = false; gbar.style.display = ""; draw(); toast("Undone"); } };
 
     studyKeys = (e) => {
@@ -1022,6 +1236,7 @@
       if (e.key === " " || e.key === "Enter") { e.preventDefault(); sess.revealed ? doGrade(3) : reveal(); }
       else if (/^[1-4]$/.test(e.key) && sess.revealed) { e.preventDefault(); doGrade(Number(e.key)); }
       else if (e.key === "z" || e.key === "Z") { e.preventDefault(); doUndo(); }
+      else if (e.key === "l" || e.key === "L") { e.preventDefault(); doLater(); }
     };
     document.addEventListener("keydown", studyKeys);
     draw();
@@ -1171,8 +1386,8 @@
           const data = JSON.parse(await inp.files[0].text());
           if (data.app !== "raddeck" || !data.decks) throw new Error("That isn't a RadDeck backup file.");
           if (!confirm("Restore this backup? It replaces the cards and progress for every module it contains.")) return;
+          S.user = normalizeUser(data.user); rebuildMods(); await saveUser();
           for (const [mid, d] of Object.entries(data.decks)) { if (!MOD[mid]) continue; S.decks[mid] = normalizeDeck(d); await saveDeck(mid); }
-          S.user = normalizeUser(data.user); await saveUser();
           S.pods = normalizePods(data.pods); await savePods();
           applyTheme(); toast("Backup restored"); renderSettings();
         } catch (e) { toast(e.message || "Couldn't read that file"); }
@@ -1188,14 +1403,16 @@
         idb.get("kv", "user"), idb.get("kv", "pods"), idb.get("kv", "outbox"), idb.entries("decks"), idb.keys("blobs"),
       ]);
       if (user) S.user = normalizeUser(user);
+      rebuildMods();
       if (pods) S.pods = normalizePods(pods);
       if (Array.isArray(outbox)) S.outbox = new Map(outbox);
-      for (const [k, v] of decks) if (MOD[k]) S.decks[k] = normalizeDeck(v);
+      for (const [k, v] of decks) S.decks[k] = normalizeDeck(v);
       for (const k of blobKeys) if (String(k).startsWith("audio/")) S.localAudio.add(String(k).slice(6));
     } catch (e) {
       console.error(e);
       toast("This browser blocked local storage, so progress won't be saved here.");
     }
+    if (!MODS.length) rebuildMods();
     applyTheme();
     window.addEventListener("hashchange", route);
     route();

@@ -33,9 +33,12 @@ Run locally with `npx wrangler dev`.
 
 ## How it works
 
-- **Studying.** Each card has its own schedule. New cards go through two short steps (1 min, 10 min), then graduate to day-based reviews. Grading Again on a review card sends it back for a 10 min relearning step and shortens its next interval. Days roll over at 4am. New cards are capped per day (Settings, default 20) and spread evenly through your reviews. Target recall (default 90%) controls how aggressive the intervals are.
-- **Keyboard.** Space shows the answer (and grades Good once it's shown), 1–4 grade, Z undoes, Esc ends the session.
-- **Podcasts** have their own listening schedule (1, 3, 7, 14, 30, 60, 120 days) and never block cards. Playback speed and position are remembered.
+- **Studying.** Each card has its own schedule (FSRS-5). New cards go through two short steps (1 min, 10 min), then graduate to day-based reviews. Again on a review card sends it back for a 10 min relearning step and shortens its next interval. Hard, Good and Easy always give different intervals, and intervals get a small random spread so cards learned together don't all come back on the same day. Days roll over at 4am. Target recall (default 90%) sets how aggressive the intervals are.
+- **More on demand.** New cards are capped per day (Settings, default 20). "Learn 10 more new" raises today's cap whenever you want, and "Review ahead" pulls in cards due in the next 3 days when nothing is due.
+- **Later.** Hides a card for 24 hours without changing its schedule (a skipped new card doesn't use up a new-card slot). Undo works on it too.
+- **Keyboard.** Space or tapping the card shows the answer (Space grades Good once it's shown), 1–4 grade, L = Later, Z undoes, Esc ends the session.
+- **Podcasts** have their own schedule, separate from cards. After a listen, rate it Felt new, Familiar or Knew it well; the next listen is set for before you'd forget, and the gap grows when you know it (up to 6 months). The Podcasts tab lists what's due, new and coming up. Playback speed and position are remembered.
+- **Your own content.** Podcasts → "Add your own podcast", or Library → Miscellaneous → "New topic", creates a topic of your own. Topics work like modules: a podcast slot and a flashcard slot, same schedules, synced. Rename or delete from the topic page.
 - **Importing.** Re-importing the same Anki deck updates changed cards and adds new ones without touching your progress. Text files: one card per line, front and back separated by a tab or comma.
 - **Storage.** Everything is saved in the browser first (IndexedDB), then synced to R2 when you're signed in. Changes made offline or signed out wait in a queue and sync later.
 - **Backup.** Settings has a JSON backup of all card text and review history (images and audio stay in R2).

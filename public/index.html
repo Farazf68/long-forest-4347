@@ -245,6 +245,17 @@ table.cards tr:first-child td { border-top: 0; }
 table.cards td.s { white-space: nowrap; color: var(--ink-2); width: 1%; text-align: right; }
 table.cards td.f { max-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+/* ---------- podcasts ---------- */
+.rate-pod { margin-top: 14px; padding: 12px 14px; border-radius: 8px; background: color-mix(in srgb, var(--accent-soft) 55%, var(--card)); }
+.rate-pod p { margin-bottom: 10px; }
+.pod-rate { display: flex; gap: 8px; flex-wrap: wrap; }
+.rate-pod.flash { animation: flash 1.2s ease-out 2; }
+@keyframes flash { 0%, 100% { box-shadow: 0 0 0 0 transparent; } 40% { box-shadow: 0 0 0 3px var(--accent); } }
+.due-ring { border-color: var(--accent); }
+.add-topic { width: 100%; background: transparent; border: 0; border-top: 1px solid var(--line); color: var(--accent); font-weight: 500; cursor: pointer; text-align: left; }
+.add-topic:hover { background: color-mix(in srgb, var(--accent-soft) 60%, var(--card)); }
+.scard.tap { cursor: pointer; }
+
 /* ---------- stats ---------- */
 .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }
 .tile { background: var(--card); border: 1px solid var(--line); border-radius: var(--r); padding: 14px 16px; }
@@ -278,7 +289,8 @@ input[type=text], input[type=password], input[type=number], select {
 .toast.show { opacity: 1; }
 .study-mode .top { display: none; }
 @media (max-width: 520px) {
-  .brand { margin-right: 4px; font-size: 16px; }
+  .brand { margin-right: 2px; font-size: 16px; }
+  .brand span { display: none; }
   .nav a { padding: 7px 8px; }
   .sync span { display: none; }
   .sync { padding: 10px; }
@@ -292,10 +304,11 @@ input[type=text], input[type=password], input[type=number], select {
 <body>
 <header class="top">
   <div class="top-in">
-    <a class="brand" href="#/"><i></i>RadDeck</a>
+    <a class="brand" href="#/" aria-label="RadDeck home"><i></i><span>RadDeck</span></a>
     <nav class="nav" id="nav">
       <a href="#/" data-nav="today">Today</a>
       <a href="#/library" data-nav="library">Library</a>
+      <a href="#/podcasts" data-nav="podcasts">Podcasts</a>
       <a href="#/stats" data-nav="stats">Stats</a>
     </nav>
     <span class="spacer"></span>
