@@ -1416,6 +1416,17 @@
         </section>
 
         <section>
+          <div class="section-h"><h2>Flashcards</h2></div>
+          <div class="card pad">
+            <div class="row between">
+              <p class="small muted" style="flex:1;min-width:220px">Delete every flashcard deck and its images, on all your devices. Podcasts, their listening schedule and your topics are kept.</p>
+              <button class="btn sm danger" id="del-all-cards">Delete all flashcards</button>
+            </div>
+            <p class="status" id="del-all-status"></p>
+          </div>
+        </section>
+
+        <section>
           <div class="section-h"><h2>Backup</h2></div>
           <div class="card pad">
             <p class="small muted" style="margin-bottom:12px">A backup holds every card's text and your review history. Images and podcasts stay in storage and aren't included.</p>
@@ -1436,6 +1447,27 @@
     const so = $("#sign-out"); if (so) so.onclick = () => { S.token = null; S.authOk = false; lsSet("rd_token", null); renderSync(); renderSettings(); };
     const sn = $("#sync-now"); if (sn) sn.onclick = async () => { S.syncError = null; await connect(); toast(S.syncError ? "Sync paused" : "Synced"); };
 
+    $("#del-all-cards").onclick = async () => {
+      const st = $("#del-all-status");
+      if (!canSync()) { st.textContent = "Sign in first, so the cards are deleted from your storage too, not just this device."; st.classList.add("err"); return; }
+      const n = Object.values(S.decks).reduce((a, d) => a + d.cards.length, 0);
+      if (!confirm(`Delete all flashcards${n ? ` (${n.toLocaleString()} cards)` : ""} from every module, on every device? Podcasts are kept. This can't be undone.`)) return;
+      try {
+        st.classList.remove("err"); st.textContent = "Deleting…";
+        await flush(); // send anything still waiting first
+        await api("/api/flashcards/cards", { method: "DELETE" });
+        for (const op of [...S.outbox.keys()]) if (/^(deck|deldeck|media):/.test(op)) S.outbox.delete(op);
+        persistOutbox();
+        for (const k of Object.keys(S.base)) if (k.startsWith("deck:")) delete S.base[k];
+        persistBase();
+        S.decks = {};
+        await idb.clear("decks");
+        for (const k of await idb.keys("blobs")) if (String(k).startsWith("media/")) await idb.del("blobs", k);
+        session = null;
+        st.textContent = `Deleted ${plural(n, "card")}. Podcasts are untouched.`;
+        toast("All flashcards deleted");
+      } catch (e) { st.textContent = e.message || "Couldn't delete the cards."; st.classList.add("err"); }
+    };
     $("#npd").onchange = async (e) => { S.user.settings.newPerDay = Math.max(0, Math.min(999, parseInt(e.target.value, 10) || 0)); await saveUser(); toast("Saved"); };
     $("#ret").onchange = async (e) => { S.user.settings.retention = Number(e.target.value); await saveUser(); toast("Saved"); };
     $("#theme").onchange = async (e) => { S.user.settings.theme = e.target.value; applyTheme(); await saveUser(); };

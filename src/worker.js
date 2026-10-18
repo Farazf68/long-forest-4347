@@ -234,6 +234,15 @@ export default {
         return err(405, "method_not_allowed", `${method} not allowed`);
       }
 
+      /* delete every deck and every card image; podcasts and progress settings are kept */
+      if (path === "/api/flashcards/cards" && method === "DELETE") {
+        const bad = needAdmin(request, env);
+        if (bad) return bad;
+        const keys = [...(await listAll(env, CARDS_PRE)), ...(await listAll(env, "media/"))].map((o) => o.key);
+        for (let i = 0; i < keys.length; i += 1000) await env.APP_STORAGE.delete(keys.slice(i, i + 1000));
+        return json({ ok: true, deleted: keys.length });
+      }
+
       let m = /^\/api\/flashcards\/cards\/([^/]+)$/.exec(path);
       if (m) {
         const mid = decodeURIComponent(m[1]);
